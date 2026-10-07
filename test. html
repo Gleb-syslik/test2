@@ -1,0 +1,847 @@
+test. html
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>R6 Fighter — Фиолетовый боец</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: radial-gradient(circle at 50% 30%, #2a1a4a 0%, #0d0818 70%);
+    min-height: 100vh;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    font-family: 'Segoe UI', Arial, sans-serif;
+    color: #e8ddff;
+    overflow: hidden;
+  }
+  #game {
+    border-radius: 14px;
+    box-shadow: 0 0 60px rgba(160,80,255,0.35), 0 0 0 2px rgba(160,80,255,0.25);
+    display: block;
+    max-width: 96vw;
+    max-height: 82vh;
+  }
+  #hint {
+    margin-top: 14px; font-size: 14px;
+    letter-spacing: 0.5px; opacity: 0.75;
+  }
+  #hint b { color: #c88aff; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<div id="hint"><b>A / D</b> — движение &nbsp;·&nbsp; <b>J</b> или <b>Пробел</b> — атака &nbsp;·&nbsp; Серия из 3 ударов = мощный пинок</div>
+
+<script>
+(() => {
+'use strict';
+
+// ============================================================
+//  БАЗА
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx    = canvas.getContext('2d');
+const W = canvas.width;
+const H = canvas.height;
+const GROUND_Y = 460;
+
+const clamp = (v,a,b) => v < a ? a : v > b ? b : v;
+
+function hexToRgb(hex){
+  const h = hex.replace('#','');
+  return [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)];
+}
+function shade(color, amt){
+  if (color[0] === '#'){
+    const [r,g,b] = hexToRgb(color);
+    return `rgb(${clamp(r+amt,0,255)},${clamp(g+amt,0,255)},${clamp(b+amt,0,255)})`;
+  }
+  const m = color.match(/(\d+)\D+(\d+)\D+(\d+)/);
+  if (!m) return color;
+  return `rgb(${clamp(+m[1]+amt,0,255)},${clamp(+m[2]+amt,0,255)},${clamp(+m[3]+amt,0,255)})`;
+}
+const easeOutCubic = x => 1 - Math.pow(1-x, 3);
+
+function roundRect(x,y,w,h,r,fill,stroke){
+  r = Math.min(r, Math.abs(w)/2, Math.abs(h)/2);
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y,   x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x,   y+h, r);
+  ctx.arcTo(x,   y+h, x,   y,   r);
+  ctx.arcTo(x,   y,   x+w, y,   r);
+  ctx.closePath();
+  if (fill)   { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke(); }
+}
+
+// ============================================================
+//  АТАКИ  (комбо: punch1 → punch2 → kick)
+// ============================================================
+const ATTACKS = {
+  punch1: { duration:0.26, hitAt:0.09, damage:6,  reach:88,  knock:100, label:'Джеб'  },
+  punch2: { duration:0.28, hitAt:0.10, damage:11, reach:95,  knock:150, label:'Кросс' },
+  kick:   { duration:0.52, hitAt:0.20, damage:28, reach:118, knock:440, label:'ПИНОК' },
+};
+
+// ============================================================
+//  СОСТОЯНИЕ ИГРЫ
+// ============================================================
+let fighters  = [];
+let particles = [];
+let floats    = [];
+let shake     = 0;
+let player;
+const keys = {};
+const stats = { totalDamage:0, currentCombo:0, bestCombo:0, comboTimer:0, comboPop:0 };
+
+// ============================================================
+//  КЛАСС БОЙЦА
+// ============================================================
+class Fighter {
+  constructor(opts){
+    this.x      = opts.x;
+    this.homeX  = opts.x;
+    this.y      = GROUND_Y;
+    this.color  = opts.color;
+    this.facing = opts.facing ?? 1;
+    this.isPlayer = !!opts.isPlayer;
+    this.isDummy  = !!opts.isDummy;
+
+    this.maxHp = opts.hp ?? 100;
+    this.hp    = this.maxHp;
+
+    this.state = 'idle';
+    this.time  = Math.random() * 5;
+
+    this.attack = null;
+    this.animTime = 0;
+    this.animDuration = 0;
+    this.hitDone = false;
+
+    this.comboStep   = 0;   // 0..3
+    this.comboWindow = 0;
+    this.attackLock  = 0;
+    this.hurtTimer   = 0;
+    this.flash       = 0;
+
+    this.vx = 0;
+    this.walkDir = 0;
+    this.respawnTimer = 0;
+
+    this.pose = { frontArm:0.14, backArm:-0.14, frontLeg:0, backLeg:0, lean:0, bob:0 };
+  }
+
+  get dead(){ return this.hp <= 0; }
+
+  canAct(){
+    return !this.dead && this.hurtTimer <= 0 && this.attackLock <= 0;
+  }
+
+  attackNow(){
+    if (!this.canAct()) return false;
+
+    // Авто-наведение на ближайшего манекена
+    if (this.isPlayer){
+      let best = null, bestD = Infinity;
+      for (const o of fighters){
+        if (o === this || !o.isDummy || o.dead) continue;
+        const d = Math.abs(o.x - this.x);
+        if (d < bestD){ bestD = d; best = o; }
+      }
+      if (best && bestD < 200) this.facing = best.x > this.x ? 1 : -1;
+    }
+
+    let name;
+    if      (this.comboWindow > 0 && this.comboStep === 1) name = 'punch2';
+    else if (this.comboWindow > 0 && this.comboStep === 2) name = 'kick';
+    else { name = 'punch1'; this.comboStep = 0; }
+
+    const a = ATTACKS[name];
+    this.attack       = { name, ...a };
+    this.animTime     = 0;
+    this.animDuration = a.duration;
+    this.hitDone      = false;
+    this.comboStep++;
+    this.comboWindow  = 0;
+    this.attackLock   = a.duration;
+    this.state        = name;
+    this.walkDir      = 0;
+    return true;
+  }
+
+  update(dt){
+    this.time += dt;
+
+    if (this.attackLock > 0) this.attackLock -= dt;
+    if (this.hurtTimer  > 0) this.hurtTimer  -= dt;
+    if (this.flash      > 0) this.flash      -= dt;
+
+    if (this.comboWindow > 0){
+      this.comboWindow -= dt;
+      if (this.comboWindow <= 0) this.comboStep = 0;
+    }
+
+    if (this.dead){
+      this.respawnTimer -= dt;
+      this.pose.bob = 0;
+      return;
+    }
+
+    // отбрасывание
+    if (Math.abs(this.vx) > 5){
+      this.x += this.vx * dt;
+      this.vx *= Math.pow(0.0008, dt);
+    } else this.vx = 0;
+
+    // прогресс атаки
+    if (this.attack){
+      this.animTime += dt;
+      if (!this.hitDone && this.animTime >= this.attack.hitAt){
+        this.hitDone = true;
+        this.performHit();
+      }
+      if (this.animTime >= this.animDuration){
+        this.attack = null;
+        this.state  = 'idle';
+        if (this.comboStep < 3) this.comboWindow = 0.42;
+        else                    this.comboStep   = 0;
+      }
+    }
+
+    // движение
+    if (!this.attack && this.hurtTimer <= 0 && !this.dead){
+      if (this.walkDir !== 0){
+        this.x += this.walkDir * 235 * dt;
+        this.state = 'walk';
+      } else {
+        this.state = 'idle';
+      }
+    }
+
+    this.updatePose(dt);
+  }
+
+  updatePose(dt){
+    const p = this.pose, t = this.time;
+
+    let fArm = 0.14, bArm = -0.14, fLeg = 0, bLeg = 0, lean = 0, bob = 0;
+
+    if (this.hurtTimer > 0){
+      lean = -0.22;
+      fArm = -0.55; bArm = -0.95;
+      bob  = 2;
+    }
+    else if (this.attack){
+      const a = this.attack;
+      const hitP = clamp(this.animTime / a.hitAt, 0, 1);
+      let ext;
+      if (this.animTime < a.hitAt) ext = easeOutCubic(hitP);
+      else {
+        const rp = clamp((this.animTime - a.hitAt) / (a.duration - a.hitAt), 0, 1);
+        ext = 1 - easeOutCubic(rp) * 0.9;
+      }
+
+      if (a.name === 'punch1'){
+        fArm = -Math.PI * 0.52 * ext;
+        bArm =  0.35 * ext;
+        lean =  0.10 * ext;
+      } else if (a.name === 'punch2'){
+        bArm = -Math.PI * 0.56 * ext;
+        fArm =  0.45 * ext;
+        lean =  0.14 * ext;
+      } else if (a.name === 'kick'){
+        fLeg = -Math.PI * 0.62 * ext;
+        bLeg =  0.22 * ext;
+        fArm = -0.9 * ext;
+        bArm =  0.9 * ext;
+        lean = -0.22 * ext;
+        bob  =  Math.sin(ext * Math.PI) * 6;
+      }
+    }
+    else if (this.state === 'walk'){
+      const w = Math.sin(t * 13);
+      fLeg =  w * 0.55;
+      bLeg = -w * 0.55;
+      fArm = -w * 0.45;
+      bArm =  w * 0.45;
+      bob  = Math.abs(Math.sin(t * 13)) * 3;
+    }
+    else {
+      bob  = Math.sin(t * 2.6) * 1.6 + 1.6;
+      fArm = 0.14 + Math.sin(t * 2.6) * 0.05;
+      bArm = -0.14 - Math.sin(t * 2.6) * 0.05;
+    }
+
+    // мгновенно для атак, плавно для остального
+    const s = this.attack ? 1 : clamp(dt * 18, 0, 1);
+    p.frontArm += (fArm - p.frontArm) * s;
+    p.backArm  += (bArm - p.backArm ) * s;
+    p.frontLeg += (fLeg - p.frontLeg) * s;
+    p.backLeg  += (bLeg - p.backLeg ) * s;
+    p.lean     += (lean - p.lean    ) * s;
+    p.bob      += (bob  - p.bob     ) * s;
+  }
+
+  performHit(){
+    const a = this.attack;
+    let hitAny = false;
+    for (const other of fighters){
+      if (other === this || other.dead) continue;
+      if (this.isDummy) continue; // манекены не бьют
+      const dx = (other.x - this.x) * this.facing;
+      if (dx > 4 && dx < a.reach){
+        other.takeDamage(a.damage, this.facing * a.knock, a.name);
+        hitAny = true;
+      }
+    }
+    if (hitAny){
+      shake = Math.min(16, shake + (a.name === 'kick' ? 15 : 5));
+    }
+  }
+
+  takeDamage(dmg, knock, attackName){
+    if (this.dead) return;
+
+    this.hp = Math.max(0, this.hp - dmg);
+    this.flash      = 0.14;
+    this.hurtTimer  = attackName === 'kick' ? 0.55 : 0.22;
+    this.attackLock = this.hurtTimer;
+    this.vx         = knock;
+    this.attack     = null;
+    this.comboStep  = 0;
+    this.comboWindow = 0;
+    this.state      = 'hurt';
+
+    // статистика
+    stats.totalDamage  += dmg;
+    stats.currentCombo++;
+    stats.comboTimer   = 1.4;
+    stats.comboPop     = 1;
+    stats.bestCombo    = Math.max(stats.bestCombo, stats.currentCombo);
+
+    // всплывающий урон
+    floats.push({
+      x: this.x + (Math.random()-0.5)*24,
+      y: this.y - 130 - Math.random()*22,
+      text: '-' + dmg,
+      life: 0.9, maxLife: 0.9,
+      color: attackName === 'kick' ? '#ffd24a' : '#ffffff',
+      size:  attackName === 'kick' ? 36 : 24,
+      vy: -95,
+      vx: (Math.random()-0.5)*50,
+    });
+
+    // частицы
+    const n = attackName === 'kick' ? 22 : 11;
+    for (let i = 0; i < n; i++){
+      const ang = Math.random() * Math.PI * 2;
+      const sp  = 90 + Math.random() * 280;
+      particles.push({
+        x: this.x + (Math.random()-0.5)*30,
+        y: this.y - 90 + (Math.random()-0.5)*50,
+        vx: Math.cos(ang) * sp,
+        vy: Math.sin(ang) * sp - 90,
+        life: 0.35 + Math.random()*0.35,
+        maxLife: 0.7,
+        color: Math.random() < 0.5 ? '#ffffff' : this.color,
+        size: 3 + Math.random()*4,
+      });
+    }
+
+    // ударное кольцо
+    particles.push({
+      x: this.x, y: this.y - 90,
+      vx:0, vy:0, ring:true,
+      life: 0.25, maxLife: 0.25,
+      color: attackName === 'kick' ? '#ffd24a' : '#ffffff',
+      size: 10,
+    });
+
+    if (this.dead){
+      this.respawnTimer = 2.2;
+      this.vx = knock * 1.6;
+    }
+  }
+}
+
+// ============================================================
+//  ОТРИСОВКА БОЙЦА (стиль R6)
+// ============================================================
+function drawLimb(px, py, w, h, angle, color){
+  ctx.save();
+  ctx.translate(px, py);
+  ctx.rotate(angle);
+  roundRect(-w/2, 0, w, h, 3, color, shade(color, -60));
+  // светлая грань
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.fillRect(-w/2 + 2, 2, 3, h - 4);
+  ctx.restore();
+}
+
+function drawFace(w, h, dead){
+  const eyeY = -h * 0.62;
+  ctx.fillStyle = '#0d0d12';
+  if (dead){
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = '#0d0d12';
+    ctx.beginPath();
+    ctx.moveTo(-10, eyeY-5); ctx.lineTo(-3, eyeY+5);
+    ctx.moveTo(-3,  eyeY-5); ctx.lineTo(-10,eyeY+5);
+    ctx.moveTo( 3,  eyeY-5); ctx.lineTo( 10,eyeY+5);
+    ctx.moveTo( 10, eyeY-5); ctx.lineTo( 3, eyeY+5);
+    ctx.stroke();
+  } else {
+    ctx.fillRect(-10, eyeY-4, 6, 8);
+    ctx.fillRect(  4, eyeY-4, 6, 8);
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.fillRect(-9, eyeY-3, 2, 2);
+    ctx.fillRect( 5, eyeY-3, 2, 2);
+    // рот
+    ctx.fillStyle = '#0d0d12';
+    ctx.fillRect(-5, eyeY + 12, 10, 2);
+  }
+}
+
+function drawFighter(f){
+  const p = f.pose;
+
+  // тень
+  ctx.save();
+  ctx.globalAlpha = 0.35;
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.ellipse(f.x, GROUND_Y + 6, 44, 11, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.save();
+  ctx.translate(f.x, GROUND_Y - p.bob);
+  ctx.scale(f.facing, 1);
+
+  // падение при смерти
+  if (f.dead){
+    const k = clamp(1 - f.respawnTimer / 2.2, 0, 1);
+    const e = easeOutCubic(Math.min(1, k * 2.4));
+    ctx.rotate(-Math.PI * 0.46 * e);
+    ctx.translate(-e * 8, -e * 6);
+  }
+
+  const baseColor = f.flash > 0 ? '#ffffff' : f.color;
+  const dark   = shade(baseColor, -45);
+  const darker = shade(baseColor, -85);
+  const light  = shade(baseColor,  32);
+
+  // пропорции R6
+  const torsoW = 34, torsoH = 44;
+  const headW  = 28, headH  = 28;
+  const armW   = 16, armH   = 44;
+  const legW   = 18, legH   = 46;
+
+  const hipY      = -legH;             // -46
+  const torsoBot  = hipY;
+  const torsoTop  = hipY - torsoH;     // -90
+  const shoulderLocalY = (torsoTop + 8) - torsoBot; // относительно низа торса
+
+  // ЗАДНЯЯ НОГА
+  drawLimb(-7, hipY, legW, legH, p.backLeg, darker);
+
+  // ГРУППА ТОРСА (с наклоном)
+  ctx.save();
+  ctx.translate(0, torsoBot);
+  ctx.rotate(p.lean);
+
+  // задняя рука
+  drawLimb(-5, shoulderLocalY, armW, armH, p.backArm, dark);
+
+  // торс
+  roundRect(-torsoW/2, -torsoH, torsoW, torsoH, 4, baseColor, darker);
+  ctx.fillStyle = 'rgba(255,255,255,0.10)';
+  ctx.fillRect(-torsoW/2 + 3, -torsoH + 3, 4, torsoH - 6);
+
+  // голова
+  ctx.save();
+  ctx.translate(0, -torsoH - 2);
+  roundRect(-headW/2, -headH, headW, headH, 5, baseColor, darker);
+  ctx.fillStyle = 'rgba(255,255,255,0.14)';
+  ctx.fillRect(-headW/2 + 3, -headH + 3, 5, headH - 6);
+  drawFace(headW, headH, f.dead);
+  ctx.restore();
+
+  // передняя рука
+  drawLimb(5, shoulderLocalY, armW, armH, p.frontArm, light);
+
+  ctx.restore();
+
+  // ПЕРЕДНЯЯ НОГА
+  drawLimb(7, hipY, legW, legH, p.frontLeg, baseColor);
+
+  ctx.restore();
+
+  // полоска здоровья манекена
+  if (f.isDummy && !f.dead) drawHealthBar(f);
+}
+
+function drawHealthBar(f){
+  const w = 90, h = 9;
+  const x = f.x - w/2;
+  const y = GROUND_Y - 178;
+  const pct = f.hp / f.maxHp;
+
+  roundRect(x - 3, y - 3, w + 6, h + 6, 5, 'rgba(0,0,0,0.65)');
+  roundRect(x, y, w, h, 3, '#2a1418');
+  const col = pct > 0.5 ? f.color : pct > 0.25 ? '#ffaa33' : '#ff4444';
+  if (w * pct > 2) roundRect(x, y, w * pct, h, 3, col);
+  // блик
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.fillRect(x + 2, y + 2, Math.max(0, w*pct - 4), 2);
+}
+
+// ============================================================
+//  ФОН
+// ============================================================
+function drawBackground(){
+  // небо
+  const g = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+  g.addColorStop(0,    '#160c2e');
+  g.addColorStop(0.55, '#261650');
+  g.addColorStop(1,    '#3a2270');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, GROUND_Y);
+
+  // свечение арены
+  const rg = ctx.createRadialGradient(W/2, GROUND_Y - 120, 30, W/2, GROUND_Y - 120, 520);
+  rg.addColorStop(0, 'rgba(160,90,255,0.22)');
+  rg.addColorStop(1, 'rgba(160,90,255,0)');
+  ctx.fillStyle = rg;
+  ctx.fillRect(0, 0, W, GROUND_Y);
+
+  // дальние колонны
+  for (let i = 0; i < 7; i++){
+    const px = 40 + i * 145;
+    ctx.fillStyle = 'rgba(0,0,0,0.30)';
+    ctx.fillRect(px, 110, 58, GROUND_Y - 110);
+    ctx.fillStyle = 'rgba(200,150,255,0.05)';
+    ctx.fillRect(px, 110, 8, GROUND_Y - 110);
+    // капитель
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(px - 6, 100, 70, 14);
+  }
+
+  // пол
+  const fg = ctx.createLinearGradient(0, GROUND_Y, 0, H);
+  fg.addColorStop(0, '#3d2a63');
+  fg.addColorStop(1, '#120a24');
+  ctx.fillStyle = fg;
+  ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+
+  // перспективные линии пола
+  const vpX = W/2, vpY = GROUND_Y - 260;
+  ctx.strokeStyle = 'rgba(160,100,255,0.10)';
+  ctx.lineWidth = 1;
+  for (let i = -12; i <= 12; i++){
+    ctx.beginPath();
+    ctx.moveTo(vpX + i * 40, GROUND_Y);
+    ctx.lineTo(vpX + i * 340, H);
+    ctx.stroke();
+  }
+
+  // линия пола
+  ctx.strokeStyle = 'rgba(190,130,255,0.55)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(0, GROUND_Y);
+  ctx.lineTo(W, GROUND_Y);
+  ctx.stroke();
+}
+
+// ============================================================
+//  ЧАСТИЦЫ / ТЕКСТ
+// ============================================================
+function updateParticles(dt){
+  for (let i = particles.length - 1; i >= 0; i--){
+    const p = particles[i];
+    p.life -= dt;
+    if (!p.ring){
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 950 * dt;
+      p.vx *= Math.pow(0.15, dt);
+    }
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+function drawParticles(){
+  for (const p of particles){
+    const a = clamp(p.life / p.maxLife, 0, 1);
+    ctx.save();
+    ctx.globalAlpha = a;
+    if (p.ring){
+      const r = p.size + (1 - a) * 55;
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = 4 * a + 1;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, Math.PI*2);
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size * a, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
+function updateFloats(dt){
+  for (let i = floats.length - 1; i >= 0; i--){
+    const f = floats[i];
+    f.life -= dt;
+    f.x += f.vx * dt;
+    f.y += f.vy * dt;
+    f.vy += 220 * dt;
+    f.vx *= Math.pow(0.2, dt);
+    if (f.life <= 0) floats.splice(i, 1);
+  }
+}
+
+function drawFloats(){
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for (const f of floats){
+    const a = clamp(f.life / f.maxLife, 0, 1);
+    const pop = 1 + (1 - a) * 0.15;
+    ctx.globalAlpha = a;
+    ctx.font = `900 ${f.size * pop}px Arial, sans-serif`;
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+    ctx.strokeText(f.text, f.x, f.y);
+    ctx.fillStyle = f.color;
+    ctx.fillText(f.text, f.x, f.y);
+  }
+  ctx.restore();
+}
+
+// ============================================================
+//  HUD
+// ============================================================
+function drawUI(){
+  // верхняя панель
+  ctx.save();
+  ctx.font = 'bold 15px Arial, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  roundRect(14, 14, 260, 62, 10, 'rgba(0,0,0,0.45)');
+  ctx.fillStyle = '#c9a8ff';
+  ctx.fillText('УРОН: ' + stats.totalDamage, 28, 24);
+  ctx.fillText('ЛУЧШЕЕ КОМБО: x' + stats.bestCombo, 28, 48);
+  ctx.restore();
+
+  // счётчик комбо
+  if (stats.currentCombo > 1){
+    const pop = 1 + stats.comboPop * 0.35;
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.globalAlpha = clamp(stats.comboTimer / 0.6, 0, 1);
+    ctx.translate(W/2, 78);
+    ctx.scale(pop, pop);
+    ctx.font = '900 46px Arial, sans-serif';
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+    ctx.strokeText('x' + stats.currentCombo, 0, 0);
+    const grad = ctx.createLinearGradient(-60, -20, 60, 20);
+    grad.addColorStop(0, '#ffd24a');
+    grad.addColorStop(1, '#ff5fa8');
+    ctx.fillStyle = grad;
+    ctx.fillText('x' + stats.currentCombo, 0, 0);
+    ctx.font = 'bold 16px Arial, sans-serif';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('КОМБО', 0, 32);
+    ctx.restore();
+  }
+
+  // подсказка о следующем ударе комбо
+  if (player && !player.dead){
+    let nextLabel = null;
+    if (player.comboWindow > 0){
+      if      (player.comboStep === 1) nextLabel = 'КРОСС';
+      else if (player.comboStep === 2) nextLabel = 'ПИНОК!';
+    }
+    if (nextLabel){
+      ctx.save();
+      ctx.globalAlpha = clamp(player.comboWindow / 0.42, 0, 1);
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 14px Arial, sans-serif';
+      ctx.fillStyle = '#ffd24a';
+      ctx.fillText('▼ ' + nextLabel, player.x, GROUND_Y - 205);
+      ctx.restore();
+    }
+  }
+}
+
+// ============================================================
+//  СОЗДАНИЕ МИРА
+// ============================================================
+function initGame(){
+  fighters = [];
+  player = new Fighter({ x: 240, color: '#a855f7', facing: 1, isPlayer: true });
+  fighters.push(player);
+
+  fighters.push(new Fighter({ x: 540, color: '#22c55e', facing: -1, isDummy: true }));
+  fighters.push(new Fighter({ x: 740, color: '#ef4444', facing: -1, isDummy: true }));
+
+  particles = [];
+  floats = [];
+  shake = 0;
+  stats.totalDamage = 0; stats.currentCombo = 0; stats.bestCombo = 0;
+  stats.comboTimer = 0; stats.comboPop = 0;
+}
+
+// ============================================================
+//  ОБНОВЛЕНИЕ
+// ============================================================
+function update(dt){
+  // ввод игрока
+  if (player && !player.dead){
+    let dir = 0;
+    if (keys['a'] || keys['arrowleft'])  dir -= 1;
+    if (keys['d'] || keys['arrowright']) dir += 1;
+
+    if (!player.attack && player.hurtTimer <= 0){
+      player.walkDir = dir;
+      if (dir !== 0) player.facing = dir;
+    } else {
+      player.walkDir = 0;
+    }
+  }
+
+  // обновление бойцов
+  for (const f of fighters) f.update(dt);
+
+  // столкновения: игрок не проходит сквозь манекены
+  if (player && !player.dead){
+    for (const d of fighters){
+      if (d === player || d.dead) continue;
+      const minDist = 62;
+      const dx = player.x - d.x;
+      const ad = Math.abs(dx);
+      if (ad < minDist){
+        player.x += Math.sign(dx || 1) * (minDist - ad);
+      }
+    }
+  }
+
+  // границы
+  for (const f of fighters) f.x = clamp(f.x, 60, W - 60);
+
+  // респаун манекенов
+  for (const f of fighters){
+    if (f.isDummy && f.dead && f.respawnTimer <= 0){
+      f.hp = f.maxHp;
+      f.hurtTimer = 0;
+      f.flash = 0;
+      f.comboStep = 0;
+      f.comboWindow = 0;
+      f.attackLock = 0;
+      f.vx = 0;
+      f.state = 'idle';
+      f.x = f.homeX;
+      // эффект возрождения
+      for (let i = 0; i < 26; i++){
+        const ang = Math.random() * Math.PI * 2;
+        particles.push({
+          x: f.x, y: GROUND_Y - 60,
+          vx: Math.cos(ang) * (60 + Math.random()*180),
+          vy: Math.sin(ang) * (60 + Math.random()*180) - 60,
+          life: 0.5, maxLife: 0.5,
+          color: f.color, size: 3 + Math.random()*4,
+        });
+      }
+    }
+  }
+
+  // таймеры комбо-статистики
+  if (stats.comboTimer > 0){
+    stats.comboTimer -= dt;
+    if (stats.comboTimer <= 0) stats.currentCombo = 0;
+  }
+  if (stats.comboPop > 0) stats.comboPop = Math.max(0, stats.comboPop - dt * 4);
+
+  // затухание тряски
+  if (shake > 0) shake = Math.max(0, shake - dt * 55);
+
+  updateParticles(dt);
+  updateFloats(dt);
+}
+
+// ============================================================
+//  РЕНДЕР
+// ============================================================
+function render(){
+  ctx.clearRect(0, 0, W, H);
+
+  ctx.save();
+  if (shake > 0.5){
+    ctx.translate((Math.random()-0.5)*shake, (Math.random()-0.5)*shake);
+  }
+
+  drawBackground();
+
+  // манекены сначала, игрок сверху
+  const ordered = [...fighters].sort((a,b) => (a.isPlayer?1:0) - (b.isPlayer?1:0));
+  for (const f of ordered) drawFighter(f);
+
+  drawParticles();
+  drawFloats();
+
+  ctx.restore();
+
+  drawUI();
+}
+
+// ============================================================
+//  ВВОД
+// ============================================================
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if ([' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) e.preventDefault();
+
+  if (!keys[k]){
+    // мгновенный отклик на нажатие
+    if ((k === 'j' || k === ' ' || k === 'enter') && player){
+      player.attackNow();
+    }
+  }
+  keys[k] = true;
+});
+window.addEventListener('keyup', e => {
+  keys[e.key.toLowerCase()] = false;
+});
+window.addEventListener('blur', () => {
+  for (const k in keys) keys[k] = false;
+});
+
+// ============================================================
+//  ИГРОВОЙ ЦИКЛ
+// ============================================================
+let lastTime = performance.now();
+function loop(now){
+  const dt = Math.min(0.04, (now - lastTime) / 1000);
+  lastTime = now;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+
+initGame();
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
